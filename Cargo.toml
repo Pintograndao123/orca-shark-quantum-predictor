@@ -1,0 +1,13 @@
+[package]
+name = "polymarket-predictor-public"
+version = "4.0.0"
+edition = "2021"
+authors = ["Sovereign Quant Architecture"]
+description = "Public High-Aesthetic 25-Agent Superintelligence Predictor & Web Spread Terminal for Polymarket Bitcoin 5M"
+
+[[bin]]
+name = "predictor_web"
+path = "src/bin/predictor_web.rs"
+
+[dependencies]
+# 100% Pure Rust Standard Library — Zero external crate dependencies!

@@ -1,0 +1,9 @@
+/target/
+.env
+.env.*
+!.env.example
+*.csv
+*.log
+*.bak*
+bankroll_state*
+.poly_browser_profile/
