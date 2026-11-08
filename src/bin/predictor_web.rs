@@ -497,7 +497,7 @@ fn parse_book_detailed(token_id: &str) -> Option<DetailedBook> {
     let url = format!("https://clob.polymarket.com/book?token_id={}", token_id);
     let body = curl_get(&url, 1.5)?;
     let mut best_bid = 0.0_f64;
-    let mut best_ask = 0.99_f64;
+    let mut best_ask = 1.00_f64;
     let mut bid_depth_top5 = 0.0_f64;
     let mut whale_usd_35to70 = 0.0_f64;
     let mut top_wall_usd = 0.0_f64;
@@ -533,7 +533,7 @@ fn parse_book_detailed(token_id: &str) -> Option<DetailedBook> {
         if let Some(a_end) = a_rem.find(']') {
             let a_slice = &a_rem[..a_end];
             for item in a_slice.split('{').skip(1) {
-                let p = extract_json_f64(item, "price").unwrap_or(0.99);
+                let p = extract_json_f64(item, "price").unwrap_or(1.00);
                 let s = extract_json_f64(item, "size").unwrap_or(0.0);
                 if p > 0.0 && s > 0.0 {
                     if p < best_ask {
@@ -547,6 +547,12 @@ fn parse_book_detailed(token_id: &str) -> Option<DetailedBook> {
 
     all_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     all_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if all_asks.is_empty() {
+        best_ask = (best_bid + 0.01).clamp(0.01, 0.999);
+    } else {
+        best_ask = best_ask.max(best_bid + 0.001).clamp(0.001, 0.999);
+    }
 
     for (i, &(p, s)) in all_bids.iter().enumerate() {
         if i < 5 {
@@ -576,10 +582,35 @@ fn parse_book_detailed(token_id: &str) -> Option<DetailedBook> {
     })
 }
 
-/// Fetches Binance 1s klines (last 65 seconds) -> returns (current, strike_open_est, sigma_1s, v5, v15, v45, taker_buy_ratio, vpin_10s, absorption, history_60)
+/// Cache em RAM da abertura TWAP 60s (`btc-5m-twap-60`) e do basis institucional USD (`Coinbase BTC-USD - Binance BTCUSDT`):
+/// `(window_start_ms, binance_open_twap_60s, open_usd_basis)`
+static BTC_TWAP_STRIKE_CACHE: std::sync::OnceLock<Mutex<(u64, f64, f64)>> = std::sync::OnceLock::new();
+
+fn fetch_coinbase_btc_usd_spot() -> Option<f64> {
+    let body = curl_get("https://api.exchange.coinbase.com/products/BTC-USD/ticker", 0.85)?;
+    let p = extract_json_f64(&body, "price")?;
+    if p > 1000.0 {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Fetches Binance 1s klines (last 65s) + Coinbase BTC-USD institutional basis + Chainlink 60s TWAP (`btc-5m-twap-60`)
+/// -> returns (current_twap_aware_usd, strike_twap_60s_usd, sigma_1s, v5, v15, v45, taker_buy_ratio, vpin_10s, absorption, history_60)
 fn fetch_binance_microstructure(symbol: &str, window_start_ms: u64) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64, Vec<f64>)> {
+    let is_btc = symbol == "BTCUSDT";
     let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1s&limit=65", symbol);
-    let body = curl_get(&url, 1.5)?;
+    let (body_opt, cb_spot_opt) = if is_btc {
+        thread::scope(|s| {
+            let h1 = s.spawn(|| curl_get(&url, 1.4));
+            let h2 = s.spawn(fetch_coinbase_btc_usd_spot);
+            (h1.join().unwrap_or(None), h2.join().unwrap_or(None))
+        })
+    } else {
+        (curl_get(&url, 1.4), None)
+    };
+    let body = body_opt?;
     let mut closes = Vec::with_capacity(65);
     let mut total_vol = 0.0_f64;
     let mut taker_buy_vol = 0.0_f64;
@@ -610,43 +641,111 @@ fn fetch_binance_microstructure(symbol: &str, window_start_ms: u64) -> Option<(f
         return None;
     }
     let n = closes.len();
-    let current = closes[n - 1];
+    let binance_last = closes[n - 1];
+    let live_usd_basis = if let Some(cb_px) = cb_spot_opt {
+        (cb_px - binance_last).clamp(-350.0, 350.0)
+    } else {
+        0.0
+    };
+
+    // Calcula ou recupera do cache o TWAP de 60 segundos exato da abertura (`[window_start_ms - 60_000, window_start_ms]`)
+    let mut strike_binance_twap = closes[0];
+    let mut strike_usd_basis = live_usd_basis;
+    if is_btc {
+        let cache_mtx = BTC_TWAP_STRIKE_CACHE.get_or_init(|| Mutex::new((0, 0.0, 0.0)));
+        let cached = cache_mtx.lock().ok().map(|g| *g).unwrap_or((0, 0.0, 0.0));
+        if cached.0 == window_start_ms && cached.1 > 1000.0 {
+            strike_binance_twap = cached.1;
+            strike_usd_basis = if cached.2 != 0.0 { cached.2 } else { live_usd_basis };
+        } else {
+            let twap_start = window_start_ms.saturating_sub(60_000);
+            let strike_url = format!(
+                "https://api.binance.com/api/v3/klines?symbol={}&interval=1s&startTime={}&limit=60",
+                symbol, twap_start
+            );
+            if let Some(s_body) = curl_get(&strike_url, 1.3) {
+                let mut sum_mid = 0.0_f64;
+                let mut cnt = 0usize;
+                for s_row in s_body.split('[').skip(2) {
+                    let s_cols: Vec<&str> = s_row.split(',').collect();
+                    if s_cols.len() >= 5 {
+                        let o = s_cols[1].trim_matches(|c| c == '"' || c == '[').parse::<f64>().unwrap_or(0.0);
+                        let c = s_cols[4].trim_matches('"').parse::<f64>().unwrap_or(0.0);
+                        if o > 0.0 && c > 0.0 {
+                            sum_mid += 0.5 * (o + c);
+                            cnt += 1;
+                        }
+                    }
+                }
+                if cnt >= 10 {
+                    strike_binance_twap = sum_mid / (cnt as f64);
+                    if let Ok(mut g) = cache_mtx.lock() {
+                        *g = (window_start_ms, strike_binance_twap, live_usd_basis);
+                    }
+                }
+            }
+        }
+    } else {
+        let strike_url = format!(
+            "https://api.binance.com/api/v3/klines?symbol={}&interval=1s&startTime={}&limit=1",
+            symbol, window_start_ms
+        );
+        if let Some(s_body) = curl_get(&strike_url, 1.2) {
+            let s_cols: Vec<&str> = s_body.split(',').collect();
+            if s_cols.len() >= 5 {
+                if let Ok(open_p) = s_cols[1].trim_matches(|c| c == '"' || c == '[').parse::<f64>() {
+                    if open_p > 0.0 {
+                        strike_binance_twap = open_p;
+                    }
+                }
+            }
+        }
+    }
+
+    // Converte a série de 1s para BTC/USD institucional (ancorado ao basis da janela + 45% de sensibilidade direta ao Coinbase BTC-USD ao vivo para furar paredes falsas de USDT)
+    let basis_delta = (live_usd_basis - strike_usd_basis).clamp(-25.0, 25.0);
+    for (idx, val) in closes.iter_mut().enumerate() {
+        let w_live = ((idx + 1) as f64) / (n as f64);
+        *val += strike_usd_basis + 0.45 * w_live * basis_delta;
+    }
+
+    let spot_now = closes[n - 1];
     let p_5 = closes[n.saturating_sub(6)];
     let p_15 = closes[n.saturating_sub(16)];
     let p_45 = closes[n.saturating_sub(46)];
-    let v5 = current - p_5;
-    let v15 = current - p_15;
-    let v45 = current - p_45;
+    let v5 = spot_now - p_5;
+    let v15 = spot_now - p_15;
+    let v45 = spot_now - p_45;
 
     let mut sum_sq = 0.0_f64;
     for i in 1..n {
         let d = closes[i] - closes[i - 1];
         sum_sq += d * d;
     }
-    let sigma_1s = (sum_sq / ((n - 1) as f64)).sqrt().max(current * 0.00004);
+    let sigma_1s = (sum_sq / ((n - 1) as f64)).sqrt().max(spot_now * 0.00004);
     let taker_ratio = if total_vol > 0.0 { (taker_buy_vol / total_vol).clamp(0.0, 1.0) } else { 0.5 };
     let vpin_10s = if vol_10s > 0.0 { (abs_imb_10s / vol_10s).clamp(0.0, 1.0) } else { 0.0 };
 
     // Effort vs Result Absorption (Agent-02)
-    let dp_10s = (current - closes[n.saturating_sub(11)]).abs();
+    let dp_10s = (spot_now - closes[n.saturating_sub(11)]).abs();
     let expected_dp = sigma_1s * 10.0_f64.sqrt();
     let absorption = (1.0 + 0.5 * (vpin_10s - (dp_10s / (expected_dp + 1e-6)) * 0.35).clamp(0.0, 1.0)).clamp(1.0, 1.5);
 
-    let strike_url = format!(
-        "https://api.binance.com/api/v3/klines?symbol={}&interval=1s&startTime={}&limit=1",
-        symbol, window_start_ms
-    );
-    let mut strike = closes[0];
-    if let Some(s_body) = curl_get(&strike_url, 1.2) {
-        let s_cols: Vec<&str> = s_body.split(',').collect();
-        if s_cols.len() >= 5 {
-            if let Ok(open_p) = s_cols[1].trim_matches(|c| c == '"' || c == '[').parse::<f64>() {
-                if open_p > 0.0 {
-                    strike = open_p;
-                }
-            }
-        }
-    }
+    let strike = strike_binance_twap + strike_usd_basis;
+
+    // Nos últimos 60s da vela (`btc-5m-twap-60`), incorpora os segundos já realizados do TWAP de liquidação!
+    let now_m = now_ms();
+    let window_end_ms = window_start_ms + 300_000;
+    let current = if is_btc && now_m < window_end_ms && window_end_ms - now_m < 60_000 {
+        let rem_s = ((window_end_ms - now_m) as f64 / 1000.0).clamp(1.0, 60.0);
+        let realized_s = (60.0 - rem_s).round().clamp(1.0, 59.0) as usize;
+        let take_n = realized_s.min(n);
+        let realized_slice = &closes[n - take_n..];
+        let realized_avg = realized_slice.iter().sum::<f64>() / (take_n as f64);
+        (realized_avg * (60.0 - rem_s) + spot_now * rem_s) / 60.0
+    } else {
+        spot_now
+    };
 
     let hist_start = n.saturating_sub(60);
     let history_60 = closes[hist_start..].to_vec();
@@ -1149,7 +1248,14 @@ fn evaluate_20_agent_swarm(
 ) {
     let tau = (m.rem_sec.max(3)) as f64;
     let sig = m.sigma_1s.max(1e-6);
-    let sigma_rem = (sig * tau.sqrt()).max(1e-6);
+    // Variância contínua C^1 da opção digital asiática Chainlink 60s TWAP (`btc-5m-twap-60`):
+    // Para tau >= 60s: Var = sig^2 * (tau - 40); para tau < 60s: Var = sig^2 * tau^3 / (3 * 60^2).
+    let eff_tau = if tau >= 60.0 {
+        tau - 40.0
+    } else {
+        (tau * tau * tau) / 10_800.0
+    };
+    let sigma_rem = (sig * eff_tau.max(0.25).sqrt()).max(1e-6);
     let strike = m.price_to_beat.max(1.0);
     let m_diff = m.diff_usd;
 
@@ -1913,10 +2019,10 @@ fn evaluate_20_agent_swarm(
         }
     }
 
-    // Consolidação TURBO (~220ms) do Predictor GOD (25 Agentes) com Tripla Trava + Pressão L2 Pré-Rompimento:
-    // 1) Lado Líder no Livro ($0.50..=$0.68, spread <= $0.04, bid >= oposto)
-    // 2) Consenso do Enxame 25 Agentes (dom_sign alinhado, weighted_score >= 12.0)
-    // 3) Impulso Spot OU Pressão Microestrutural L2/Taker na mesma direção (bloqueando armadilhas contra o fluxo Taker)
+    // Consolidação TURBO (~220ms) do Predictor GOD (25 Agentes) com Tripla Trava + Edge Líquido Pós-Taxa ($+):
+    // 1) Lado Líder no Livro ($0.50..=$0.66, spread <= $0.04, bid >= oposto + 2¢)
+    // 2) Consenso Forte do Enxame 25 Agentes (dom_sign alinhado, weighted_score >= 13.5, aligned >= 13)
+    // 3) TWAP 60s BTC/USD + Velocidade 15s + Fluxo L2/Taker estritamente a favor (zero entrada contra o TWAP/Taker)
     if !mem.locked.active {
         let (lead_dir, lead_sign, lead_bid, lead_ask, other_bid) = if m.up_bid > m.down_bid + 0.005 {
             ("UP", 1i8, m.up_bid, m.up_ask, m.down_bid)
@@ -1927,24 +2033,24 @@ fn evaluate_20_agent_swarm(
             (dom_dir, dom_sign, target_bid, target_ask, ob)
         };
         let lead_spread = (lead_ask - lead_bid).max(0.0);
-        let good_price = (0.50..=0.68).contains(&lead_ask) && lead_bid >= other_bid && lead_spread <= 0.04;
-        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 12.0 && aligned >= 12;
-        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.38 && m.binance_obi_20 < -0.15))
-            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.62 && m.binance_obi_20 > 0.15));
+        let good_price = (0.50..=0.66).contains(&lead_ask) && lead_bid >= other_bid + 0.02 && lead_spread <= 0.04;
+        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 13.5 && aligned >= 13;
+        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.42 && m.binance_obi_20 < -0.10))
+            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.58 && m.binance_obi_20 > 0.10));
         let spot_agrees = no_taker_trap
             && ((lead_sign > 0
-                && m.diff_usd >= -0.25
-                && m.vel_15s >= -0.25
-                && (m.diff_usd >= 0.80 || m.binance_obi_20 >= 0.12 || m.taker_buy_ratio >= 0.54 || lead_bid >= other_bid + 0.03))
+                && m.diff_usd >= 0.35
+                && m.vel_15s >= 0.0
+                && (m.diff_usd >= 1.25 || (m.binance_obi_20 >= 0.14 && m.taker_buy_ratio >= 0.54) || lead_bid >= other_bid + 0.05))
                 || (lead_sign < 0
-                    && m.diff_usd <= 0.25
-                    && m.vel_15s <= 0.25
-                    && (m.diff_usd <= -0.80 || m.binance_obi_20 <= -0.12 || m.taker_buy_ratio <= 0.46 || lead_bid >= other_bid + 0.03)));
-        let good_time = (45..=288).contains(&m.rem_sec);
+                    && m.diff_usd <= -0.35
+                    && m.vel_15s <= 0.0
+                    && (m.diff_usd <= -1.25 || (m.binance_obi_20 <= -0.14 && m.taker_buy_ratio <= 0.46) || lead_bid >= other_bid + 0.05)));
+        let good_time = (45..=285).contains(&m.rem_sec);
         let cooldown_ok = now_m >= mem.cooldown_until_ms;
 
         if good_price && swarm_agrees && spot_agrees && good_time && cooldown_ok {
-            if mem.calc_candidate_dir == lead_sign || m.diff_usd.abs() >= 1.50 || lead_bid >= other_bid + 0.04 {
+            if mem.calc_candidate_dir == lead_sign || m.diff_usd.abs() >= 2.00 || lead_bid >= other_bid + 0.06 {
                 mem.calc_confirm_ticks = 2;
             } else {
                 mem.calc_candidate_dir = lead_sign;
@@ -1956,8 +2062,8 @@ fn evaluate_20_agent_swarm(
 
         if mem.calc_confirm_ticks >= 2 {
             let lead_entry = if lead_ask > lead_bid + 0.01 { (lead_ask - 0.01).max(0.01) } else { lead_ask };
-            let lead_tp = (lead_entry + 0.08).min(0.95);
-            let lead_stop = (lead_entry - 0.14).max(0.05);
+            let lead_tp = (lead_entry + 0.09).min(0.95);
+            let lead_stop = (lead_entry - 0.12).max(0.32);
             let stake = if weighted_score >= 18.0 || aligned >= 18 {
                 2.0
             } else {
@@ -3235,17 +3341,24 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         None => return "{\"ok\":false,\"msg\":\"PROXY_WALLET inválida\"}".to_string(),
     };
 
-    let max_wallet_cents = if wallet_pusd > 0.52 {
-        ((wallet_pusd - 0.005) * 100.0).floor() as u64
-    } else {
-        10_000
-    };
-    let target_usd = usd_amount.max(0.54);
-    let usd_cents = ((target_usd * 100.0).round() as u64).min(max_wallet_cents).max(54);
+    if wallet_pusd < 1.00 {
+        let msg = format!(
+            "⚠️ Saldo pUSD atual (${:.4}) abaixo do mínimo da Polymarket ($1.00 para compra BUY) — aguardando próximo depósito $+.",
+            wallet_pusd
+        );
+        if let Ok(mut st) = st_arc.lock() {
+            st.last_action_log = msg.clone();
+        }
+        return format!("{{\"ok\":false,\"msg\":\"{}\"}}", escape_json(&msg));
+    }
+
+    let max_wallet_cents = ((wallet_pusd - 0.005) * 100.0).floor().max(100.0) as u64;
+    let target_usd = usd_amount.max(1.00);
+    let usd_cents = ((target_usd * 100.0).round() as u64).min(max_wallet_cents).max(100);
     let req_cents = (price * 100.0).round().clamp(1.0, 99.0) as u64;
     let ask_cents = (live_ask * 100.0).round().clamp(1.0, 99.0) as u64;
 
-    // Calcula cotas quebradinhas exatas (centi-shares) garantindo que maker_a (USDC) seja múltiplo exato de $0.01 (10_000) e caiba no saldo!
+    // Calcula cotas quebradinhas exatas (centi-shares) garantindo que maker_a (USDC) seja múltiplo exato de $0.01 (10_000) >= $1.00 e caiba no saldo!
     let calc_buy_amounts = |px_c: u64| -> (u64, u64, f64, f64) {
         let mut a = px_c.max(1);
         let mut b = 100u64;
@@ -3270,7 +3383,7 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         (maker_a, taker_a, sh_f, px_f)
     };
 
-    // Se a compra de $1/$2 gera menos de 5 cotas, usa ordem Marketable (FAK/FOK) no Ask atual (ou teto múltiplo de 5¢ com price improvement!)
+    // Com >= 5.00 shares (ex: stakes >= $2.60-$3.30), permite Maker GTC (0% taxa) se req_cents < ask_cents; caso contrário usa FAK/FOK na melhor oferta!
     let prelim_centi_sh = (usd_cents * 100 + req_cents - 1) / req_cents;
     let eff_cents = if prelim_centi_sh < 500 {
         ask_cents
@@ -3279,10 +3392,8 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
     };
 
     let (maker_amt, taker_amt, shares, clean_price) = calc_buy_amounts(eff_cents);
-    let buy_tifs: &[&str] = if prelim_centi_sh < 500 {
+    let buy_tifs: &[&str] = if prelim_centi_sh < 500 || eff_cents >= ask_cents {
         &["FAK", "FOK"]
-    } else if eff_cents >= ask_cents {
-        &["FAK", "FOK", "GTC"]
     } else {
         &["GTC", "FAK", "FOK"]
     };
@@ -3302,18 +3413,20 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         last_resp = resp;
     }
 
-    // Fallback instantâneo: teto múltiplo de 5¢ (step = 0.20 share) e +1¢ acima com FAK (executa pelo Ask real via price improvement!)
+    // Fallback instantâneo FAK (+1¢ / +2¢ / teto 5¢) se o topo do livro moveu 1 tick durante o envio
     if !success && eff_cents < 96 {
         let grid5_c = (((ask_cents + 4) / 5) * 5).clamp(5, 95);
-        for &bump_c in &[grid5_c, (ask_cents + 1).min(96), (ask_cents + 2).min(96)] {
+        for &bump_c in &[(ask_cents + 1).min(96), (ask_cents + 2).min(96), grid5_c] {
             let (m2, t2, sh2, _px2) = calc_buy_amounts(bump_c);
-            let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, t2, "FAK");
-            if ok2 {
-                success = true;
-                last_resp = r2;
-                used_px = (ask_cents as f64) / 100.0;
-                used_sh = sh2;
-                break;
+            if m2 >= 1_000_000 {
+                let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, t2, "FAK");
+                if ok2 {
+                    success = true;
+                    last_resp = r2;
+                    used_px = (ask_cents as f64) / 100.0;
+                    used_sh = sh2;
+                    break;
+                }
             }
         }
     }
