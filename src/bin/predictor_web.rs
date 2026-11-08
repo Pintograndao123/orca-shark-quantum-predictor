@@ -416,7 +416,14 @@ fn fetch_data_api_open_positions(wallet: &str) -> Vec<RawApiPos> {
         };
         let avg_price = extract_json_f64(block, "avg_price").unwrap_or(0.50);
         let cost_usd = extract_json_f64(block, "entry_cost_usdc").unwrap_or(size * avg_price);
-        let cur_price = extract_json_f64(block, "current_price").unwrap_or(0.0);
+        let mut cur_price = extract_json_f64(block, "current_price").unwrap_or(0.0);
+        if cur_price >= 0.01 && !slug.starts_with("btc-updown-5m-") {
+            if let Some(bk) = parse_book_detailed(&token_id) {
+                if bk.best_bid > 0.001 {
+                    cur_price = compute_vwap_bid(bk.best_bid, &bk.bids_top4, size);
+                }
+            }
+        }
         out.push(RawApiPos {
             token_id,
             slug,
