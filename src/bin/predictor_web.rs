@@ -3366,9 +3366,9 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         None => return "{\"ok\":false,\"msg\":\"PROXY_WALLET inválida\"}".to_string(),
     };
 
-    if wallet_pusd < 1.00 {
+    if wallet_pusd < 0.25 {
         let msg = format!(
-            "⚠️ Saldo pUSD atual (${:.4}) abaixo do mínimo da Polymarket ($1.00 para compra BUY) — aguardando próximo depósito $+.",
+            "⚠️ Saldo pUSD atual (${:.4}) abaixo do mínimo de centavos ($0.25 para 5 cotas @ $0.05) — aguardando próximo depósito $+.",
             wallet_pusd
         );
         if let Ok(mut st) = st_arc.lock() {
@@ -3377,80 +3377,119 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         return format!("{{\"ok\":false,\"msg\":\"{}\"}}", escape_json(&msg));
     }
 
-    let max_wallet_cents = ((wallet_pusd - 0.005) * 100.0).floor().max(100.0) as u64;
-    let target_usd = usd_amount.max(1.00);
-    let usd_cents = ((target_usd * 100.0).round() as u64).min(max_wallet_cents).max(100);
+    let max_taker_usd = (wallet_pusd / 1.042).max(0.25);
+    let max_maker_usd = (wallet_pusd - 0.005).max(0.25);
     let req_cents = (price * 100.0).round().clamp(1.0, 99.0) as u64;
     let ask_cents = (live_ask * 100.0).round().clamp(1.0, 99.0) as u64;
 
-    // Calcula cotas quebradinhas exatas (centi-shares) garantindo que maker_a (USDC) seja múltiplo exato de $0.01 (10_000) >= $1.00 e caiba no saldo!
-    let calc_buy_amounts = |px_c: u64| -> (u64, u64, f64, f64) {
-        let mut a = px_c.max(1);
-        let mut b = 100u64;
-        while b != 0 {
-            let t = b;
-            b = a % b;
-            a = t;
-        }
-        let step = (100 / a.max(1)).clamp(1, 100);
-        let raw_c = ((usd_cents * 100 + px_c - 1) / px_c).max(100);
-        let up_c = ((raw_c + step - 1) / step) * step;
-        let dn_c = (raw_c / step).max(1) * step;
-        let centi_sh = if up_c * px_c <= max_wallet_cents * 100 {
-            up_c
-        } else {
-            dn_c
-        };
-        let taker_a = centi_sh * 10_000;
-        let maker_a = centi_sh * px_c * 100;
-        let sh_f = (centi_sh as f64) / 100.0;
-        let px_f = (px_c as f64) / 100.0;
-        (maker_a, taker_a, sh_f, px_f)
-    };
-
-    // Com >= 5.00 shares (ex: stakes >= $2.60-$3.30), permite Maker GTC (0% taxa) se req_cents < ask_cents; caso contrário usa FAK/FOK na melhor oferta!
-    let prelim_centi_sh = (usd_cents * 100 + req_cents - 1) / req_cents;
-    let eff_cents = if prelim_centi_sh < 500 {
-        ask_cents
-    } else {
-        req_cents.min(ask_cents)
-    };
-
-    let (maker_amt, taker_amt, shares, clean_price) = calc_buy_amounts(eff_cents);
-    let buy_tifs: &[&str] = if prelim_centi_sh < 500 || eff_cents >= ask_cents {
-        &["FAK", "FOK"]
-    } else {
-        &["GTC", "FAK", "FOK"]
-    };
-
     let mut success = false;
     let mut last_resp = String::new();
-    let mut used_px = clean_price;
-    let mut used_sh = shares;
+    let mut used_px: f64;
+    let mut used_sh: f64;
 
-    for &tif in buy_tifs {
-        let (ok, resp) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, maker_amt, taker_amt, tif);
+    if max_taker_usd < 1.00 || usd_amount < 1.00 {
+        // MODO CENTAVOS PROGRESSIVO ($0.25..$1.00): Usa >= 5.00 shares (500 centi-shares) com orderType = "GTC"!
+        let max_taker_px_c = ((max_taker_usd * 100.0) / 5.0).floor().clamp(1.0, 95.0) as u64;
+        let max_maker_px_c = ((max_maker_usd * 100.0) / 5.0).floor().clamp(1.0, 95.0) as u64;
+        let px_c = if ask_cents <= max_taker_px_c {
+            ask_cents
+        } else {
+            req_cents.min(max_maker_px_c).min(ask_cents.saturating_sub(1)).max(1)
+        };
+        let centi_sh = 500u64;
+        let taker_amt = centi_sh * 10_000;
+        let maker_amt = centi_sh * px_c * 100;
+        used_sh = 5.00;
+        used_px = (px_c as f64) / 100.0;
+
+        let (ok, resp) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, maker_amt, taker_amt, "GTC");
         if ok {
             success = true;
-            last_resp = resp;
-            break;
         }
         last_resp = resp;
-    }
 
-    // Fallback instantâneo FAK (+1¢ / +2¢ / teto 5¢) se o topo do livro moveu 1 tick durante o envio
-    if !success && eff_cents < 96 {
-        let grid5_c = (((ask_cents + 4) / 5) * 5).clamp(5, 95);
-        for &bump_c in &[(ask_cents + 1).min(96), (ask_cents + 2).min(96), grid5_c] {
-            let (m2, t2, sh2, _px2) = calc_buy_amounts(bump_c);
-            if m2 >= 1_000_000 {
-                let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, t2, "FAK");
-                if ok2 {
-                    success = true;
-                    last_resp = r2;
-                    used_px = (ask_cents as f64) / 100.0;
-                    used_sh = sh2;
-                    break;
+        if !success && px_c + 1 <= max_taker_px_c {
+            let bump_c = px_c + 1;
+            let m2 = centi_sh * bump_c * 100;
+            let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, taker_amt, "GTC");
+            if ok2 {
+                success = true;
+                used_px = (bump_c as f64) / 100.0;
+            }
+            last_resp = r2;
+        }
+    } else {
+        let max_wallet_cents = (max_taker_usd * 100.0).floor().max(100.0) as u64;
+        let target_usd = usd_amount.max(1.00);
+        let usd_cents = ((target_usd * 100.0).round() as u64).min(max_wallet_cents).max(100);
+
+        // Calcula cotas quebradinhas exatas (centi-shares) garantindo que maker_a (USDC) seja múltiplo exato de $0.01 (10_000) >= $1.00 e caiba no saldo!
+        let calc_buy_amounts = |px_c: u64| -> (u64, u64, f64, f64) {
+            let mut a = px_c.max(1);
+            let mut b = 100u64;
+            while b != 0 {
+                let t = b;
+                b = a % b;
+                a = t;
+            }
+            let step = (100 / a.max(1)).clamp(1, 100);
+            let raw_c = ((usd_cents * 100 + px_c - 1) / px_c).max(100);
+            let up_c = ((raw_c + step - 1) / step) * step;
+            let dn_c = (raw_c / step).max(1) * step;
+            let centi_sh = if up_c * px_c <= max_wallet_cents * 100 {
+                up_c
+            } else {
+                dn_c
+            };
+            let taker_a = centi_sh * 10_000;
+            let maker_a = centi_sh * px_c * 100;
+            let sh_f = (centi_sh as f64) / 100.0;
+            let px_f = (px_c as f64) / 100.0;
+            (maker_a, taker_a, sh_f, px_f)
+        };
+
+        // Com >= 5.00 shares (ex: stakes >= $2.60-$3.30), permite Maker GTC (0% taxa) se req_cents < ask_cents; caso contrário usa FAK/FOK na melhor oferta!
+        let prelim_centi_sh = (usd_cents * 100 + req_cents - 1) / req_cents;
+        let eff_cents = if prelim_centi_sh < 500 {
+            ask_cents
+        } else {
+            req_cents.min(ask_cents)
+        };
+
+        let (maker_amt, taker_amt, shares, clean_price) = calc_buy_amounts(eff_cents);
+        let buy_tifs: &[&str] = if prelim_centi_sh < 500 || eff_cents >= ask_cents {
+            &["FAK", "FOK"]
+        } else {
+            &["GTC", "FAK", "FOK"]
+        };
+
+        used_px = clean_price;
+        used_sh = shares;
+
+        for &tif in buy_tifs {
+            let (ok, resp) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, maker_amt, taker_amt, tif);
+            if ok {
+                success = true;
+                last_resp = resp;
+                break;
+            }
+            last_resp = resp;
+        }
+
+        // Fallback instantâneo FAK (+1¢ / +2¢ / teto 5¢) se o topo do livro moveu 1 tick durante o envio
+        if !success && eff_cents < 96 {
+            let grid5_c = (((ask_cents + 4) / 5) * 5).clamp(5, 95);
+            for &bump_c in &[(ask_cents + 1).min(96), (ask_cents + 2).min(96), grid5_c] {
+                let (m2, t2, sh2, _px2) = calc_buy_amounts(bump_c);
+                if m2 >= 1_000_000 {
+                    let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, t2, "FAK");
+                    if ok2 {
+                        success = true;
+                        last_resp = r2;
+                        used_px = (ask_cents as f64) / 100.0;
+                        used_sh = sh2;
+                        break;
+                    }
                 }
             }
         }
