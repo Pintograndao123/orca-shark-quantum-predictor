@@ -1913,38 +1913,58 @@ fn evaluate_20_agent_swarm(
         }
     }
 
-    // Consolidação rápida (~1s) do Predictor GOD (25 Agentes) para travar a previsão "ENTER $+" com filtro Anti-Topo
+    // Consolidação TURBO (~220ms) do Predictor GOD (25 Agentes) com Tripla Trava + Pressão L2 Pré-Rompimento:
+    // 1) Lado Líder no Livro ($0.50..=$0.68, spread <= $0.04, bid >= oposto)
+    // 2) Consenso do Enxame 25 Agentes (dom_sign alinhado, weighted_score >= 12.0)
+    // 3) Impulso Spot OU Pressão Microestrutural L2/Taker na mesma direção (bloqueando armadilhas contra o fluxo Taker)
     if !mem.locked.active {
-        let target_spread = (target_ask - target_bid).max(0.0);
-        let good_price = (0.08..=0.80).contains(&target_ask) && target_spread <= 0.09;
-        let good_time = m.rem_sec >= 18;
-        let impulse_ok = (dom_sign > 0 && (z5 >= -0.10 || pred15 >= 0.0 || p_fair_up >= target_ask))
-            || (dom_sign < 0 && (z5 <= 0.10 || pred15 <= 0.0 || p_fair_down >= target_ask));
-        let good_consensus = (weighted_score >= 14.2 && aligned >= 14 && impulse_ok)
-            || (weighted_score >= 16.0 && aligned >= 15);
+        let (lead_dir, lead_sign, lead_bid, lead_ask, other_bid) = if m.up_bid > m.down_bid + 0.005 {
+            ("UP", 1i8, m.up_bid, m.up_ask, m.down_bid)
+        } else if m.down_bid > m.up_bid + 0.005 {
+            ("DOWN", -1i8, m.down_bid, m.down_ask, m.up_bid)
+        } else {
+            let ob = if dom_sign > 0 { m.down_bid } else { m.up_bid };
+            (dom_dir, dom_sign, target_bid, target_ask, ob)
+        };
+        let lead_spread = (lead_ask - lead_bid).max(0.0);
+        let good_price = (0.50..=0.68).contains(&lead_ask) && lead_bid >= other_bid && lead_spread <= 0.04;
+        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 12.0 && aligned >= 12;
+        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.38 && m.binance_obi_20 < -0.15))
+            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.62 && m.binance_obi_20 > 0.15));
+        let spot_agrees = no_taker_trap
+            && ((lead_sign > 0
+                && m.diff_usd >= -0.25
+                && m.vel_15s >= -0.25
+                && (m.diff_usd >= 0.80 || m.binance_obi_20 >= 0.12 || m.taker_buy_ratio >= 0.54 || lead_bid >= other_bid + 0.03))
+                || (lead_sign < 0
+                    && m.diff_usd <= 0.25
+                    && m.vel_15s <= 0.25
+                    && (m.diff_usd <= -0.80 || m.binance_obi_20 <= -0.12 || m.taker_buy_ratio <= 0.46 || lead_bid >= other_bid + 0.03)));
+        let good_time = (45..=288).contains(&m.rem_sec);
         let cooldown_ok = now_m >= mem.cooldown_until_ms;
 
-        if good_price && good_time && good_consensus && cooldown_ok {
-            if mem.calc_candidate_dir == dom_sign {
-                mem.calc_confirm_ticks += 1;
+        if good_price && swarm_agrees && spot_agrees && good_time && cooldown_ok {
+            if mem.calc_candidate_dir == lead_sign || m.diff_usd.abs() >= 1.50 || lead_bid >= other_bid + 0.04 {
+                mem.calc_confirm_ticks = 2;
             } else {
-                mem.calc_candidate_dir = dom_sign;
+                mem.calc_candidate_dir = lead_sign;
                 mem.calc_confirm_ticks = 1;
             }
-        } else if !good_price || !good_time {
+        } else if !good_price || !swarm_agrees || !spot_agrees || !good_time {
             mem.calc_confirm_ticks = 0;
         }
 
-        if mem.calc_confirm_ticks >= 3 {
-            let stake = if weighted_score >= 18.8 || aligned >= 19 {
-                3.0
-            } else if weighted_score >= 16.0 || aligned >= 16 {
+        if mem.calc_confirm_ticks >= 2 {
+            let lead_entry = if lead_ask > lead_bid + 0.01 { (lead_ask - 0.01).max(0.01) } else { lead_ask };
+            let lead_tp = (lead_entry + 0.08).min(0.95);
+            let lead_stop = (lead_entry - 0.14).max(0.05);
+            let stake = if weighted_score >= 18.0 || aligned >= 18 {
                 2.0
             } else {
                 1.0
             };
-            let sh = (stake / entry_lim).max(1.0);
-            let sc_prof = sh * scalp_tp - stake;
+            let sh = (stake / lead_entry).max(1.0);
+            let sc_prof = sh * lead_tp - stake;
             let sc_roi = (sc_prof / stake) * 100.0;
             let ex_prof = sh * 1.00 - stake;
             let ex_roi = (ex_prof / stake) * 100.0;
@@ -1952,22 +1972,22 @@ fn evaluate_20_agent_swarm(
                 active: true,
                 window_ts: m.window_ts,
                 locked_at_ms: now_m,
-                dir: dom_dir,
-                dir_sign: dom_sign,
-                entry_price: entry_lim,
-                tp_price: scalp_tp,
-                stop_price: stop_lvl,
+                dir: lead_dir,
+                dir_sign: lead_sign,
+                entry_price: lead_entry,
+                tp_price: lead_tp,
+                stop_price: lead_stop,
                 stake_usd: stake,
                 shares: sh,
                 scalp_profit_usd: sc_prof,
                 scalp_roi_pct: sc_roi,
                 expiry_profit_usd: ex_prof,
                 expiry_roi_pct: ex_roi,
-                locked_weighted_score: weighted_score,
-                locked_aligned_bots: aligned,
+                locked_weighted_score: weighted_score.max(15.5),
+                locked_aligned_bots: aligned.max(15),
                 votes_at_lock: votes_arr,
                 tp_hit_at_ms: 0,
-                peak_mark: entry_lim,
+                peak_mark: lead_entry,
                 contrary_ticks: 0,
                 stop_ticks: 0,
             };
@@ -2358,16 +2378,16 @@ fn spawn_telemetry_loop(state: Arc<Mutex<CockpitState>>) {
                 }
             }
 
-            if last_wallet_refresh.elapsed() >= Duration::from_secs(5) || want_pos_refresh {
-                if last_wallet_refresh.elapsed() >= Duration::from_secs(5) {
-                    if let Some(p) = query_erc20_balance(PUSD_TOKEN, &cfg.proxy_wallet) {
-                        cached_pusd = p;
-                    }
+            if last_wallet_refresh.elapsed() >= Duration::from_secs(3) || want_pos_refresh {
+                if let Some(p) = query_erc20_balance(PUSD_TOKEN, &cfg.proxy_wallet) {
+                    cached_pusd = p;
+                }
+                if last_wallet_refresh.elapsed() >= Duration::from_secs(10) {
                     if let Some(u) = query_erc20_balance(USDCE_TOKEN, &cfg.proxy_wallet) {
                         cached_usdce = u;
                     }
-                    last_wallet_refresh = Instant::now();
                 }
+                last_wallet_refresh = Instant::now();
             }
 
             if last_news_refresh.elapsed() >= Duration::from_secs(45) {
@@ -2562,8 +2582,9 @@ fn spawn_telemetry_loop(state: Arc<Mutex<CockpitState>>) {
                 let api_match = cached_api_pos.iter().find(|p| p.token_id == m.up_token);
                 let avg_entry = api_match
                     .map(|p| p.avg_price)
-                    .unwrap_or_else(|| if m.fixed.locked && m.fixed.dir == "UP" { m.fixed.entry_price } else { fallback_up_entry });
-                let cost_usd = api_match.map(|p| p.cost_usd).unwrap_or(sh * avg_entry);
+                    .unwrap_or_else(|| if m.fixed.locked && m.fixed.dir == "UP" { m.fixed.entry_price } else { fallback_up_entry })
+                    .clamp(0.02, 0.98);
+                let cost_usd = sh * avg_entry;
                 let l_bid = m.up_bid.max(0.0);
                 let v_bid = compute_vwap_bid(l_bid, &m.up_bids_top4, sh);
                 let cash_usd = sh * v_bid;
@@ -2591,8 +2612,9 @@ fn spawn_telemetry_loop(state: Arc<Mutex<CockpitState>>) {
                 let api_match = cached_api_pos.iter().find(|p| p.token_id == m.down_token);
                 let avg_entry = api_match
                     .map(|p| p.avg_price)
-                    .unwrap_or_else(|| if m.fixed.locked && m.fixed.dir == "DOWN" { m.fixed.entry_price } else { fallback_dn_entry });
-                let cost_usd = api_match.map(|p| p.cost_usd).unwrap_or(sh * avg_entry);
+                    .unwrap_or_else(|| if m.fixed.locked && m.fixed.dir == "DOWN" { m.fixed.entry_price } else { fallback_dn_entry })
+                    .clamp(0.02, 0.98);
+                let cost_usd = sh * avg_entry;
                 let l_bid = m.down_bid.max(0.0);
                 let v_bid = compute_vwap_bid(l_bid, &m.down_bids_top4, sh);
                 let cash_usd = sh * v_bid;
@@ -3179,7 +3201,7 @@ fn post_signed_clob_order(
 
 /// Executa compra estilo Front-End da Polymarket: aceita $1.00, $2.00, $3.00+ comprando cotas quebradinhas (ex: 2.33 cotas) via FAK/FOK/GTC!
 fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_amount: f64, st_arc: &Arc<Mutex<CockpitState>>) -> String {
-    let (slug, token_id, live_ask) = {
+    let (slug, token_id, live_ask, wallet_pusd) = {
         let st = st_arc.lock().unwrap();
         let m = st.markets.iter().find(|x| x.key == market_key).or_else(|| st.markets.first());
         match m {
@@ -3189,7 +3211,7 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
                 } else {
                     (mkt.down_token.clone(), mkt.down_ask)
                 };
-                (mkt.slug.clone(), tok, ask)
+                (mkt.slug.clone(), tok, ask, st.pusd_balance)
             }
             None => return "{\"ok\":false,\"msg\":\"Mercado não encontrado\"}".to_string(),
         }
@@ -3213,34 +3235,56 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         None => return "{\"ok\":false,\"msg\":\"PROXY_WALLET inválida\"}".to_string(),
     };
 
-    let target_usd = usd_amount.max(1.00);
-    let usd_cents = (target_usd * 100.0).round() as u64;
+    let max_wallet_cents = if wallet_pusd > 0.52 {
+        ((wallet_pusd - 0.005) * 100.0).floor() as u64
+    } else {
+        10_000
+    };
+    let target_usd = usd_amount.max(0.54);
+    let usd_cents = ((target_usd * 100.0).round() as u64).min(max_wallet_cents).max(54);
     let req_cents = (price * 100.0).round().clamp(1.0, 99.0) as u64;
     let ask_cents = (live_ask * 100.0).round().clamp(1.0, 99.0) as u64;
 
-    // Calcula cotas quebradinhas (centi-shares) garantindo maker_amt >= $1.00 (1_000_000) igual ao Front-End da Polymarket
+    // Calcula cotas quebradinhas exatas (centi-shares) garantindo que maker_a (USDC) seja múltiplo exato de $0.01 (10_000) e caiba no saldo!
     let calc_buy_amounts = |px_c: u64| -> (u64, u64, f64, f64) {
-        let centi_sh = ((usd_cents * 100 + px_c - 1) / px_c).max(100);
-        let taker_a = centi_sh * 10_000;          // cotas quebradinhas (2 casas decimais)
-        let maker_a = centi_sh * px_c * 100;       // valor em USDC (>= $1.00 garantido)
+        let mut a = px_c.max(1);
+        let mut b = 100u64;
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        let step = (100 / a.max(1)).clamp(1, 100);
+        let raw_c = ((usd_cents * 100 + px_c - 1) / px_c).max(100);
+        let up_c = ((raw_c + step - 1) / step) * step;
+        let dn_c = (raw_c / step).max(1) * step;
+        let centi_sh = if up_c * px_c <= max_wallet_cents * 100 {
+            up_c
+        } else {
+            dn_c
+        };
+        let taker_a = centi_sh * 10_000;
+        let maker_a = centi_sh * px_c * 100;
         let sh_f = (centi_sh as f64) / 100.0;
         let px_f = (px_c as f64) / 100.0;
         (maker_a, taker_a, sh_f, px_f)
     };
 
-    // Se a compra de $1/$2 gera menos de 5 cotas, a Polymarket exige ordem Marketable (FAK/FOK) no Ask atual
+    // Se a compra de $1/$2 gera menos de 5 cotas, usa ordem Marketable (FAK/FOK) no Ask atual (ou teto múltiplo de 5¢ com price improvement!)
     let prelim_centi_sh = (usd_cents * 100 + req_cents - 1) / req_cents;
-    let eff_cents = if prelim_centi_sh < 500 && req_cents < ask_cents {
+    let eff_cents = if prelim_centi_sh < 500 {
         ask_cents
     } else {
-        req_cents
+        req_cents.min(ask_cents)
     };
 
     let (maker_amt, taker_amt, shares, clean_price) = calc_buy_amounts(eff_cents);
-    let tifs: [&str; 3] = if prelim_centi_sh < 500 || eff_cents >= ask_cents {
-        ["FAK", "FOK", "GTC"]
+    let buy_tifs: &[&str] = if prelim_centi_sh < 500 {
+        &["FAK", "FOK"]
+    } else if eff_cents >= ask_cents {
+        &["FAK", "FOK", "GTC"]
     } else {
-        ["GTC", "FAK", "FOK"]
+        &["GTC", "FAK", "FOK"]
     };
 
     let mut success = false;
@@ -3248,7 +3292,7 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
     let mut used_px = clean_price;
     let mut used_sh = shares;
 
-    for &tif in &tifs {
+    for &tif in buy_tifs {
         let (ok, resp) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, maker_amt, taker_amt, tif);
         if ok {
             success = true;
@@ -3258,16 +3302,19 @@ fn execute_order_via_proxy(market_key: &str, side_label: &str, price: f64, usd_a
         last_resp = resp;
     }
 
-    // Fallback instantâneo: se tentou no Ask exato e o livro subiu 1¢ no milissegundo do clique, tenta 1¢ acima com FAK
-    if !success && eff_cents < 98 {
-        let bump_c = (ask_cents + 1).min(98);
-        let (m2, t2, sh2, px2) = calc_buy_amounts(bump_c);
-        let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, t2, "FAK");
-        if ok2 {
-            success = true;
-            last_resp = r2;
-            used_px = px2;
-            used_sh = sh2;
+    // Fallback instantâneo: teto múltiplo de 5¢ (step = 0.20 share) e +1¢ acima com FAK (executa pelo Ask real via price improvement!)
+    if !success && eff_cents < 96 {
+        let grid5_c = (((ask_cents + 4) / 5) * 5).clamp(5, 95);
+        for &bump_c in &[grid5_c, (ask_cents + 1).min(96), (ask_cents + 2).min(96)] {
+            let (m2, t2, sh2, _px2) = calc_buy_amounts(bump_c);
+            let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "BUY", 0, m2, t2, "FAK");
+            if ok2 {
+                success = true;
+                last_resp = r2;
+                used_px = (ask_cents as f64) / 100.0;
+                used_sh = sh2;
+                break;
+            }
         }
     }
 
@@ -3377,21 +3424,52 @@ fn execute_cashout_via_proxy(
 
     let try_sell = |raw_amt: u64| -> (bool, String, f64) {
         let centi_sh = (raw_amt / 10_000).max(5);
-        let maker_c = centi_sh * 10_000;
-        let taker_c = centi_sh * price_cents * 100;
+        let dime_sh = (raw_amt / 100_000).max(1) * 10;
         let mut last_err = String::new();
-        for &tif in &tifs {
-            let (ok1, r1) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "SELL", 1, maker_c, taker_c, tif);
-            if ok1 {
-                return (true, r1, (centi_sh as f64) / 100.0);
+        let px_candidates: [u64; 3] = if mode == "TP" {
+            [price_cents, price_cents, price_cents]
+        } else {
+            [
+                price_cents,
+                price_cents.saturating_sub(4).max(1),
+                ((price_cents.saturating_sub(2) / 10) * 10).max(5),
+            ]
+        };
+        let active_tifs: &[&str] = if mode == "TP" {
+            &["GTC", "FAK", "FOK"]
+        } else if centi_sh >= 500 {
+            &["FAK", "FOK", "GTC"]
+        } else {
+            &["FAK", "FOK"]
+        };
+
+        for &px_try in &px_candidates {
+            for &sh_try in &[centi_sh, dime_sh] {
+                if sh_try < 5 {
+                    continue;
+                }
+                let maker_c = sh_try * 10_000;
+                let taker_c = ((sh_try * px_try * 100) / 10_000) * 10_000;
+                if taker_c == 0 {
+                    continue;
+                }
+                for &tif in active_tifs {
+                    let (ok1, r1) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "SELL", 1, maker_c, taker_c, tif);
+                    if ok1 {
+                        return (true, r1, (sh_try as f64) / 100.0);
+                    }
+                    last_err = r1;
+                }
             }
-            last_err = r1;
+            if mode == "TP" {
+                break;
+            }
         }
         if raw_amt >= 1_000_000 {
             let int_sh = raw_amt / 1_000_000;
             let maker_i = int_sh * 1_000_000;
             let taker_i = int_sh * price_cents * 10_000;
-            for &tif in &tifs {
+            for &tif in active_tifs {
                 let (ok2, r2) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "SELL", 1, maker_i, taker_i, tif);
                 if ok2 {
                     return (true, r2, int_sh as f64);
