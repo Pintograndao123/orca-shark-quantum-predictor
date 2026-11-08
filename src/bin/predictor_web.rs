@@ -2044,22 +2044,24 @@ fn evaluate_20_agent_swarm(
             && aligned >= 18
             && m.diff_usd.abs() >= 10.0
             && ((lead_sign > 0 && m.vel_15s >= 2.5) || (lead_sign < 0 && m.vel_15s <= -2.5));
-        let max_ask_lim = if super_impulse { 0.76 } else { 0.68 };
-        let max_spread_lim = if super_impulse { 0.06 } else { 0.045 };
-        let good_price = (0.50..=max_ask_lim).contains(&lead_ask) && lead_bid >= other_bid + 0.02 && lead_spread <= max_spread_lim;
-        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 13.5 && aligned >= 13;
-        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.42 && m.binance_obi_20 < -0.10))
-            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.58 && m.binance_obi_20 > 0.10));
+        let max_ask_lim = if super_impulse { 0.75 } else { 0.67 };
+        let max_spread_lim = if super_impulse { 0.055 } else { 0.04 };
+        let good_price = (0.50..=max_ask_lim).contains(&lead_ask) && lead_bid >= other_bid + 0.03 && lead_spread <= max_spread_lim;
+        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 14.5 && aligned >= 14;
+        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.44 && m.binance_obi_20 < -0.08))
+            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.56 && m.binance_obi_20 > 0.08));
         let spot_agrees = no_taker_trap
             && ((lead_sign > 0
-                && m.diff_usd >= 0.35
-                && m.vel_15s >= 0.0
-                && (m.diff_usd >= 1.25 || (m.binance_obi_20 >= 0.14 && m.taker_buy_ratio >= 0.54) || lead_bid >= other_bid + 0.05))
+                && m.diff_usd >= 0.80
+                && m.vel_5s >= 0.0
+                && m.vel_15s >= 0.20
+                && (m.diff_usd >= 1.80 || (m.binance_obi_20 >= 0.15 && m.taker_buy_ratio >= 0.54) || lead_bid >= other_bid + 0.05))
                 || (lead_sign < 0
-                    && m.diff_usd <= -0.35
-                    && m.vel_15s <= 0.0
-                    && (m.diff_usd <= -1.25 || (m.binance_obi_20 <= -0.14 && m.taker_buy_ratio <= 0.46) || lead_bid >= other_bid + 0.05)));
-        let good_time = (40..=295).contains(&m.rem_sec);
+                    && m.diff_usd <= -0.80
+                    && m.vel_5s <= 0.0
+                    && m.vel_15s <= -0.20
+                    && (m.diff_usd <= -1.80 || (m.binance_obi_20 <= -0.15 && m.taker_buy_ratio <= 0.46) || lead_bid >= other_bid + 0.05)));
+        let good_time = (42..=294).contains(&m.rem_sec);
         let cooldown_ok = now_m >= mem.cooldown_until_ms;
 
         if good_price && swarm_agrees && spot_agrees && good_time && cooldown_ok {
