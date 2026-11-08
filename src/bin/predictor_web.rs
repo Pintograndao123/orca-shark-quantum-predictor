@@ -2490,7 +2490,7 @@ fn spawn_telemetry_loop(state: Arc<Mutex<CockpitState>>) {
                 }
             }
 
-            if last_wallet_refresh.elapsed() >= Duration::from_secs(3) || want_pos_refresh {
+            if last_wallet_refresh.elapsed() >= Duration::from_millis(1200) || want_pos_refresh {
                 if let Some(p) = query_erc20_balance(PUSD_TOKEN, &cfg.proxy_wallet) {
                     cached_pusd = p;
                 }
@@ -2694,7 +2694,7 @@ fn spawn_telemetry_loop(state: Arc<Mutex<CockpitState>>) {
                 let api_match = cached_api_pos.iter().find(|p| p.token_id == m.up_token);
                 let avg_entry = api_match
                     .map(|p| p.avg_price)
-                    .unwrap_or_else(|| if m.fixed.locked && m.fixed.dir == "UP" { m.fixed.entry_price } else { fallback_up_entry })
+                    .unwrap_or(fallback_up_entry)
                     .clamp(0.02, 0.98);
                 let cost_usd = sh * avg_entry;
                 let l_bid = m.up_bid.max(0.0);
@@ -2724,7 +2724,7 @@ fn spawn_telemetry_loop(state: Arc<Mutex<CockpitState>>) {
                 let api_match = cached_api_pos.iter().find(|p| p.token_id == m.down_token);
                 let avg_entry = api_match
                     .map(|p| p.avg_price)
-                    .unwrap_or_else(|| if m.fixed.locked && m.fixed.dir == "DOWN" { m.fixed.entry_price } else { fallback_dn_entry })
+                    .unwrap_or(fallback_dn_entry)
                     .clamp(0.02, 0.98);
                 let cost_usd = sh * avg_entry;
                 let l_bid = m.down_bid.max(0.0);
