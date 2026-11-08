@@ -1964,13 +1964,21 @@ fn evaluate_20_agent_swarm(
             0.0
         };
 
-        // Realiza lucro (%$) ao atingir o Alvo Scalp, ou via Trailing Profit Lock (bateu >= +14% e recuou 3.5%), ou reta final no lucro
-        let trailing_tp = peak_pnl_pct >= 14.0 && live_pnl_pct >= 9.5 && (peak_pnl_pct - live_pnl_pct) >= 3.5;
-        let tp_reached = mark >= mem.locked.tp_price || trailing_tp || (m.rem_sec <= 22 && live_pnl_pct >= 5.0);
+        // Realiza lucro (%$) via Super-Trailing Exponencial (sobe até $0.93 com trava móvel de 2.5¢), Catraca Breakeven+ (+7.5% -> trava +2.5%), ou reta final
+        let momentum_surging = (mem.locked.dir_sign > 0 && m.vel_5s >= 0.4 && m.vel_15s >= 0.4 && m.taker_buy_ratio >= 0.50)
+            || (mem.locked.dir_sign < 0 && m.vel_5s <= -0.4 && m.vel_15s <= -0.4 && m.taker_buy_ratio <= 0.50);
+        let exp_runner_tp = mark >= 0.93
+            || ((mark >= mem.locked.tp_price || peak_pnl_pct >= 12.5) && (!momentum_surging || mark <= mem.locked.peak_mark - 0.025));
+        let breakeven_ratchet = peak_pnl_pct >= 7.5 && (live_pnl_pct <= 2.5 || mark <= mem.locked.entry_price + 0.015);
+        let tp_reached = exp_runner_tp || breakeven_ratchet || (m.rem_sec <= 28 && live_pnl_pct >= 2.0);
         if tp_reached && mem.locked.tp_hit_at_ms == 0 {
             mem.locked.tp_hit_at_ms = now_m;
-            let best_pnl_usd = mem.locked.shares * (mem.locked.peak_mark.max(mark) - mem.locked.entry_price);
-            let realized = best_pnl_usd.max(live_pnl_usd).max(mem.locked.scalp_profit_usd * 0.75);
+            let exit_m = if breakeven_ratchet {
+                mark.max(mem.locked.entry_price + 0.015)
+            } else {
+                (mem.locked.peak_mark - 0.015).max(mark)
+            };
+            let realized = (mem.locked.shares * (exit_m - mem.locked.entry_price)).max(0.02);
             mem.session_wins += 1;
             mem.session_pnl_usd += realized;
             for b_idx in 0..25 {
@@ -1984,13 +1992,13 @@ fn evaluate_20_agent_swarm(
         }
 
         if mem.locked.tp_hit_at_ms > 0 {
-            if now_m.saturating_sub(mem.locked.tp_hit_at_ms) >= 10_000 {
+            if now_m.saturating_sub(mem.locked.tp_hit_at_ms) >= 6_000 {
                 mem.locked.active = false;
                 mem.calc_confirm_ticks = 0;
                 mem.cooldown_until_ms = now_m + 1_500;
             }
         } else {
-            let is_contrary = (dom_sign != mem.locked.dir_sign && weighted_score >= 18.5) || opp_weighted_score >= 18.5;
+            let is_contrary = (dom_sign != mem.locked.dir_sign && weighted_score >= 15.0) || opp_weighted_score >= 15.0;
             if is_contrary {
                 mem.locked.contrary_ticks += 1;
             } else {
@@ -2002,15 +2010,17 @@ fn evaluate_20_agent_swarm(
                 mem.locked.stop_ticks = 0;
             }
 
-            // Só invalida se realmente perder o Stop Fixo sustentadamente + reversão estrutural forte (nunca em ruído/pullback curto!)
-            if age_sec >= 40 && mem.locked.stop_ticks >= 10 && mem.locked.contrary_ticks >= 8 {
-                if live_pnl_usd >= 0.0 {
+            // Stop Curto Blindagem Ouro: se tocar o Stop (-5.5¢ / -8.5%) por 2 ticks (~440ms) ou fluxo reverter, corta imediatamente preservando ~91% da stake!
+            if mem.locked.stop_ticks >= 2 || mark <= mem.locked.entry_price - 0.065 || (age_sec >= 8 && mem.locked.stop_ticks >= 1 && mem.locked.contrary_ticks >= 2) {
+                let stop_exit = mark.max(mem.locked.stop_price - 0.01);
+                let cut_pnl = mem.locked.shares * (stop_exit - mem.locked.entry_price);
+                if cut_pnl >= 0.0 {
                     mem.session_wins += 1;
                 } else {
                     mem.session_losses += 1;
                 }
-                mem.session_pnl_usd += live_pnl_usd;
-                let move_sign = if live_pnl_usd >= 0.0 { 1.0 } else { -1.0 };
+                mem.session_pnl_usd += cut_pnl;
+                let move_sign = if cut_pnl >= 0.0 { 1.0 } else { -1.0 };
                 for b_idx in 0..25 {
                     let v = mem.locked.votes_at_lock[b_idx];
                     if v != 0 {
@@ -2021,7 +2031,7 @@ fn evaluate_20_agent_swarm(
                 }
                 mem.locked.active = false;
                 mem.calc_confirm_ticks = 0;
-                mem.cooldown_until_ms = now_m + 2_000;
+                mem.cooldown_until_ms = now_m + 2_500;
             }
         }
     }
@@ -2077,8 +2087,8 @@ fn evaluate_20_agent_swarm(
 
         if mem.calc_confirm_ticks >= 2 {
             let lead_entry = if lead_ask > lead_bid + 0.01 { (lead_ask - 0.01).max(0.01) } else { lead_ask };
-            let lead_tp = (lead_entry + 0.09).min(0.95);
-            let lead_stop = (lead_entry - 0.12).max(0.32);
+            let lead_tp = (lead_entry + 0.085).min(0.93);
+            let lead_stop = (lead_entry - 0.055).max(lead_entry * 0.90).max(0.35);
             let stake = if weighted_score >= 18.0 || aligned >= 18 {
                 2.0
             } else {
