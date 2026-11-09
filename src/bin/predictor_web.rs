@@ -2050,33 +2050,37 @@ fn evaluate_20_agent_swarm(
             (dom_dir, dom_sign, target_bid, target_ask, ob)
         };
         let lead_spread = (lead_ask - lead_bid).max(0.0);
-        let super_impulse = weighted_score >= 18.0
-            && aligned >= 18
-            && m.diff_usd.abs() >= 10.0
-            && ((lead_sign > 0 && m.vel_15s >= 2.5) || (lead_sign < 0 && m.vel_15s <= -2.5));
-        let max_ask_lim = if super_impulse { 0.75 } else { 0.67 };
-        let max_spread_lim = if super_impulse { 0.055 } else { 0.04 };
-        let good_price = (0.50..=max_ask_lim).contains(&lead_ask) && lead_bid >= other_bid + 0.03 && lead_spread <= max_spread_lim;
-        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 14.5 && aligned >= 14;
-        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.44 && m.binance_obi_20 < -0.08))
-            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.56 && m.binance_obi_20 > 0.08));
+        let super_impulse = weighted_score >= 18.5
+            && aligned >= 19
+            && m.diff_usd.abs() >= 14.0
+            && ((lead_sign > 0 && m.vel_5s >= 0.8 && m.vel_15s >= 3.0 && m.vel_45s >= 1.0)
+                || (lead_sign < 0 && m.vel_5s <= -0.8 && m.vel_15s <= -3.0 && m.vel_45s <= -1.0));
+        let max_ask_lim = if super_impulse { 0.72 } else { 0.64 };
+        let max_spread_lim = if super_impulse { 0.045 } else { 0.035 };
+        let good_price = (0.50..=max_ask_lim).contains(&lead_ask) && lead_bid >= other_bid + 0.04 && lead_spread <= max_spread_lim;
+        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 16.0 && aligned >= 16;
+        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.46 && m.binance_obi_20 < -0.06))
+            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.54 && m.binance_obi_20 > 0.06));
         let spot_agrees = no_taker_trap
             && ((lead_sign > 0
-                && m.diff_usd >= 0.80
-                && m.vel_5s >= 0.0
-                && m.vel_15s >= 0.20
-                && (m.diff_usd >= 1.80 || (m.binance_obi_20 >= 0.15 && m.taker_buy_ratio >= 0.54) || lead_bid >= other_bid + 0.05))
+                && m.diff_usd >= 5.00
+                && m.vel_5s >= 0.30
+                && m.vel_15s >= 1.00
+                && m.vel_45s >= -1.00
+                && (m.diff_usd >= 8.00 || (m.binance_obi_20 >= 0.12 && m.taker_buy_ratio >= 0.53) || lead_bid >= other_bid + 0.06))
                 || (lead_sign < 0
-                    && m.diff_usd <= -0.80
-                    && m.vel_5s <= 0.0
-                    && m.vel_15s <= -0.20
-                    && (m.diff_usd <= -1.80 || (m.binance_obi_20 <= -0.15 && m.taker_buy_ratio <= 0.46) || lead_bid >= other_bid + 0.05)));
-        let good_time = (42..=294).contains(&m.rem_sec);
+                    && m.diff_usd <= -5.00
+                    && m.vel_5s <= -0.30
+                    && m.vel_15s <= -1.00
+                    && m.vel_45s <= 1.00
+                    && (m.diff_usd <= -8.00 || (m.binance_obi_20 <= -0.12 && m.taker_buy_ratio <= 0.47) || lead_bid >= other_bid + 0.06)));
+        // Aguarda os primeiros 32s da vela (rem_sec <= 268) para eliminar falso sinal de ressaca da vela anterior!
+        let good_time = (45..=268).contains(&m.rem_sec);
         let cooldown_ok = now_m >= mem.cooldown_until_ms;
 
         if good_price && swarm_agrees && spot_agrees && good_time && cooldown_ok {
-            if mem.calc_candidate_dir == lead_sign || m.diff_usd.abs() >= 2.00 || lead_bid >= other_bid + 0.06 || super_impulse {
-                mem.calc_confirm_ticks = 2;
+            if mem.calc_candidate_dir == lead_sign {
+                mem.calc_confirm_ticks = mem.calc_confirm_ticks.saturating_add(1);
             } else {
                 mem.calc_candidate_dir = lead_sign;
                 mem.calc_confirm_ticks = 1;
@@ -2085,7 +2089,7 @@ fn evaluate_20_agent_swarm(
             mem.calc_confirm_ticks = 0;
         }
 
-        if mem.calc_confirm_ticks >= 2 {
+        if mem.calc_confirm_ticks >= 3 {
             let lead_entry = if lead_ask > lead_bid + 0.01 { (lead_ask - 0.01).max(0.01) } else { lead_ask };
             let lead_tp = (lead_entry + 0.085).min(0.93);
             let lead_stop = (lead_entry - 0.055).max(lead_entry * 0.90).max(0.35);
