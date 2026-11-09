@@ -3623,8 +3623,8 @@ fn execute_cashout_via_proxy(
     };
 
     let try_sell = |raw_amt: u64| -> (bool, String, f64) {
-        let centi_sh = (raw_amt / 10_000).max(5);
-        let dime_sh = (raw_amt / 100_000).max(1) * 10;
+        let mut centi_sh = (raw_amt / 10_000).max(5);
+        let mut dime_sh = (raw_amt / 100_000).max(1) * 10;
         let mut last_err = String::new();
         let px_candidates: [u64; 3] = if mode == "TP" {
             [price_cents, price_cents, price_cents]
@@ -3644,12 +3644,13 @@ fn execute_cashout_via_proxy(
         };
 
         for &px_try in &px_candidates {
-            for &sh_try in &[centi_sh, dime_sh] {
+            let candidates = [centi_sh, dime_sh];
+            for &sh_try in &candidates {
                 if sh_try < 5 {
                     continue;
                 }
                 let maker_c = sh_try * 10_000;
-                let taker_c = ((sh_try * px_try * 100) / 10_000) * 10_000;
+                let taker_c = sh_try * px_try * 100;
                 if taker_c == 0 {
                     continue;
                 }
@@ -3657,6 +3658,28 @@ fn execute_cashout_via_proxy(
                     let (ok1, r1) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "SELL", 1, maker_c, taker_c, tif);
                     if ok1 {
                         return (true, r1, (sh_try as f64) / 100.0);
+                    }
+                    if let Some(b_idx) = r1.find("balance:") {
+                        let rest = r1[b_idx + 8..].trim_start();
+                        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(clob_bal) = digits.parse::<u64>() {
+                            if clob_bal < 50_000 {
+                                return (false, r1, (sh_try as f64) / 100.0);
+                            }
+                            let exact_centi = clob_bal / 10_000;
+                            if exact_centi >= 5 && exact_centi < sh_try {
+                                centi_sh = exact_centi;
+                                dime_sh = (exact_centi / 10).max(1) * 10;
+                                let m_ex = exact_centi * 10_000;
+                                let t_ex = exact_centi * px_try * 100;
+                                let (ok_ex, r_ex) = post_signed_clob_order(&cfg, pk2, pk2_addr, maker_addr, &token_id, "SELL", 1, m_ex, t_ex, tif);
+                                if ok_ex {
+                                    return (true, r_ex, (exact_centi as f64) / 100.0);
+                                }
+                                last_err = r_ex;
+                                break;
+                            }
+                        }
                     }
                     last_err = r1;
                 }
@@ -3666,7 +3689,7 @@ fn execute_cashout_via_proxy(
             }
         }
         if raw_amt >= 1_000_000 {
-            let int_sh = raw_amt / 1_000_000;
+            let int_sh = (centi_sh / 100).max(1);
             let maker_i = int_sh * 1_000_000;
             let taker_i = int_sh * price_cents * 10_000;
             for &tif in active_tifs {
