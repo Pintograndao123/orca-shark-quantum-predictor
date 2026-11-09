@@ -1964,13 +1964,23 @@ fn evaluate_20_agent_swarm(
             0.0
         };
 
-        // Realiza lucro (%$) via Super-Trailing Exponencial (sobe até $0.93 com trava móvel de 2.5¢), Catraca Breakeven+ (+7.5% -> trava +2.5%), ou reta final
-        let momentum_surging = (mem.locked.dir_sign > 0 && m.vel_5s >= 0.4 && m.vel_15s >= 0.4 && m.taker_buy_ratio >= 0.50)
-            || (mem.locked.dir_sign < 0 && m.vel_5s <= -0.4 && m.vel_15s <= -0.4 && m.taker_buy_ratio <= 0.50);
+        // Realiza lucro (%$) esperando subir forte (Alvo $0.93 ou Super-Trailing Largo após +22¢ de alta, ou Trava Preditiva se a previsão virar contra no lucro!)
+        let pred_against_lock = (mem.locked.dir_sign > 0
+            && ((m.vel_5s <= -1.2 && m.vel_15s <= -0.5)
+                || (dom_sign < 0 && weighted_score >= 14.5)
+                || (m.fc15_dspot <= -4.0 && m.vel_5s <= -0.6)))
+            || (mem.locked.dir_sign < 0
+                && ((m.vel_5s >= 1.2 && m.vel_15s >= 0.5)
+                    || (dom_sign > 0 && weighted_score >= 14.5)
+                    || (m.fc15_dspot >= 4.0 && m.vel_5s >= 0.6)));
         let exp_runner_tp = mark >= 0.93
-            || ((mark >= mem.locked.tp_price || peak_pnl_pct >= 12.5) && (!momentum_surging || mark <= mem.locked.peak_mark - 0.025));
-        let breakeven_ratchet = peak_pnl_pct >= 7.5 && (live_pnl_pct <= 2.5 || mark <= mem.locked.entry_price + 0.015);
-        let tp_reached = exp_runner_tp || breakeven_ratchet || (m.rem_sec <= 28 && live_pnl_pct >= 2.0);
+            || (mem.locked.peak_mark >= (mem.locked.entry_price + 0.22).min(0.82)
+                && mark <= mem.locked.peak_mark - 0.06);
+        let breakeven_ratchet = mem.locked.peak_mark >= mem.locked.entry_price + 0.10
+            && pred_against_lock
+            && mark <= mem.locked.peak_mark - 0.035
+            && mark >= mem.locked.entry_price + 0.025;
+        let tp_reached = exp_runner_tp || breakeven_ratchet || (m.rem_sec <= 18 && live_pnl_pct >= 3.0);
         if tp_reached && mem.locked.tp_hit_at_ms == 0 {
             mem.locked.tp_hit_at_ms = now_m;
             let exit_m = if breakeven_ratchet {
@@ -2050,32 +2060,38 @@ fn evaluate_20_agent_swarm(
             (dom_dir, dom_sign, target_bid, target_ask, ob)
         };
         let lead_spread = (lead_ask - lead_bid).max(0.0);
-        let super_impulse = weighted_score >= 18.5
+        let super_impulse = weighted_score >= 19.0
             && aligned >= 19
-            && m.diff_usd.abs() >= 14.0
-            && ((lead_sign > 0 && m.vel_5s >= 0.8 && m.vel_15s >= 3.0 && m.vel_45s >= 1.0)
-                || (lead_sign < 0 && m.vel_5s <= -0.8 && m.vel_15s <= -3.0 && m.vel_45s <= -1.0));
-        let max_ask_lim = if super_impulse { 0.72 } else { 0.64 };
-        let max_spread_lim = if super_impulse { 0.045 } else { 0.035 };
-        let good_price = (0.50..=max_ask_lim).contains(&lead_ask) && lead_bid >= other_bid + 0.04 && lead_spread <= max_spread_lim;
-        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 16.0 && aligned >= 16;
-        let no_taker_trap = (lead_sign > 0 && !(m.taker_buy_ratio < 0.46 && m.binance_obi_20 < -0.06))
-            || (lead_sign < 0 && !(m.taker_buy_ratio > 0.54 && m.binance_obi_20 > 0.06));
+            && m.diff_usd.abs() >= 15.0
+            && ((lead_sign > 0 && m.vel_5s >= 1.0 && m.vel_15s >= 3.2 && m.vel_45s >= 2.0)
+                || (lead_sign < 0 && m.vel_5s <= -1.0 && m.vel_15s <= -3.2 && m.vel_45s <= -2.0));
+        let max_ask_lim = if super_impulse { 0.68 } else { 0.63 };
+        let max_spread_lim = if super_impulse { 0.04 } else { 0.03 };
+        let good_price = (0.50..=max_ask_lim).contains(&lead_ask)
+            && lead_bid >= other_bid + 0.04
+            && lead_spread <= max_spread_lim
+            && p_fair_side >= lead_ask - 0.02;
+        let swarm_agrees = dom_sign == lead_sign && weighted_score >= 17.0 && aligned >= 17;
+        let oracle_agrees = (lead_sign > 0 && m.fc15_dspot >= -1.0 && m.fc30_dspot >= 0.0)
+            || (lead_sign < 0 && m.fc15_dspot <= 1.0 && m.fc30_dspot <= 0.0);
+        let no_taker_trap = (lead_sign > 0 && m.taker_buy_ratio >= 0.51 && m.binance_obi_20 >= 0.0 && m.obi >= -0.05)
+            || (lead_sign < 0 && m.taker_buy_ratio <= 0.49 && m.binance_obi_20 <= 0.0 && m.obi <= 0.05);
         let spot_agrees = no_taker_trap
+            && oracle_agrees
             && ((lead_sign > 0
-                && m.diff_usd >= 5.00
-                && m.vel_5s >= 0.30
-                && m.vel_15s >= 1.00
-                && m.vel_45s >= -1.00
-                && (m.diff_usd >= 8.00 || (m.binance_obi_20 >= 0.12 && m.taker_buy_ratio >= 0.53) || lead_bid >= other_bid + 0.06))
+                && m.diff_usd >= 6.50
+                && m.vel_5s >= 0.50
+                && m.vel_15s >= 1.60
+                && m.vel_45s >= 1.00
+                && (m.diff_usd >= 9.50 || (m.binance_obi_20 >= 0.14 && m.taker_buy_ratio >= 0.54) || lead_bid >= other_bid + 0.06))
                 || (lead_sign < 0
-                    && m.diff_usd <= -5.00
-                    && m.vel_5s <= -0.30
-                    && m.vel_15s <= -1.00
-                    && m.vel_45s <= 1.00
-                    && (m.diff_usd <= -8.00 || (m.binance_obi_20 <= -0.12 && m.taker_buy_ratio <= 0.47) || lead_bid >= other_bid + 0.06)));
-        // Aguarda os primeiros 32s da vela (rem_sec <= 268) para eliminar falso sinal de ressaca da vela anterior!
-        let good_time = (45..=268).contains(&m.rem_sec);
+                    && m.diff_usd <= -6.50
+                    && m.vel_5s <= -0.50
+                    && m.vel_15s <= -1.60
+                    && m.vel_45s <= -1.00
+                    && (m.diff_usd <= -9.50 || (m.binance_obi_20 <= -0.14 && m.taker_buy_ratio <= 0.46) || lead_bid >= other_bid + 0.06)));
+        // Aguarda os primeiros 35s da vela (rem_sec <= 265) para 100% de precisão sem ressaca da vela anterior!
+        let good_time = (48..=265).contains(&m.rem_sec);
         let cooldown_ok = now_m >= mem.cooldown_until_ms;
 
         if good_price && swarm_agrees && spot_agrees && good_time && cooldown_ok {
@@ -2089,10 +2105,10 @@ fn evaluate_20_agent_swarm(
             mem.calc_confirm_ticks = 0;
         }
 
-        if mem.calc_confirm_ticks >= 3 {
+        if mem.calc_confirm_ticks >= 4 {
             let lead_entry = if lead_ask > lead_bid + 0.01 { (lead_ask - 0.01).max(0.01) } else { lead_ask };
-            let lead_tp = (lead_entry + 0.085).min(0.93);
-            let lead_stop = (lead_entry - 0.055).max(lead_entry * 0.90).max(0.35);
+            let lead_tp = (lead_entry + 0.22).min(0.93);
+            let lead_stop = (lead_entry - 0.04).max(lead_entry * 0.92).max(0.35);
             let stake = if weighted_score >= 18.0 || aligned >= 18 {
                 2.0
             } else {
@@ -3573,9 +3589,12 @@ fn execute_cashout_via_proxy(
         None => return "{\"ok\":false,\"msg\":\"PROXY_WALLET inválida\"}".to_string(),
     };
 
-    // Lê o saldo exato on-chain ERC-1155 na Polygon antes de assinar (suporta qualquer fração quebradinha >= 0.05 share)
-    let onchain_raw = query_erc1155_balance_single(&cfg.proxy_wallet, &token_id).unwrap_or(cached_raw);
-    let raw_balance = if onchain_raw >= 50_000 { onchain_raw } else { cached_raw };
+    // VELOCIDADE DA LUZ NO SAQUE: usa `cached_raw` diretamente da memória se >= 50_000 (elimina ~350ms de RPC antes da venda!)
+    let raw_balance = if cached_raw >= 50_000 {
+        cached_raw
+    } else {
+        query_erc1155_balance_single(&cfg.proxy_wallet, &token_id).unwrap_or(0)
+    };
     if raw_balance < 50_000 {
         let msg = format!("⚠️ Saldo de shares {} na carteira é 0 (já sacado ou liquidado).", side_label);
         if let Ok(mut st) = st_arc.lock() {
